@@ -41,7 +41,13 @@ ALTER PROCEDURE [dbo].[IndexOptimize]
 @DatabaseOrder nvarchar(max) = NULL,
 @DatabasesInParallel nvarchar(max) = 'N',
 @LogToTable nvarchar(max) = 'N',
-@Execute nvarchar(max) = 'Y'
+@Execute nvarchar(max) = 'Y',
+
+-- 239_indexoptimize_tlog: add transaction log wait
+@TransactionLogWaitTries int = NULL,
+@TransactionLogWaitTime int = 60,
+@TransactionLogHighPercent int = 75,
+@TransactionLogLowPercent int = 50
 
 AS
 
@@ -157,6 +163,12 @@ BEGIN
   DECLARE @CurrentStatisticsSample int
   DECLARE @CurrentStatisticsResample nvarchar(max)
   DECLARE @CurrentDelay datetime
+
+  -- 239_indexoptimize_tlog: add transaction log wait
+  DECLARE @CurrentTransactionLogPercent TINYINT;
+  DECLARE @CurrentTransactionLogWaitTry INT;
+  DECLARE @CurrentTransactionLogWaitTime datetime;
+  -- end add transaction log wait
 
   DECLARE @tmpDatabases TABLE (ID int IDENTITY,
                                DatabaseName nvarchar(max),
@@ -1063,6 +1075,38 @@ BEGIN
     RAISERROR(@EmptyLine,10,1) WITH NOWAIT
   END
 
+  -- 0239_indexoptimize_tlog: add transaction log wait
+
+  IF @TransactionLogWaitTries < 0 
+  BEGIN
+    SET @ErrorMessage = 'The value for the parameter @TransactionLogWaitTries is not supported.' + CHAR(13) + CHAR(10) + ' '
+    RAISERROR( @ErrorMessage, 16, 1 ) WITH NOWAIT
+	SET @Error = @@ERROR
+  END
+
+  IF @TransactionLogWaitTime < 0
+  BEGIN
+    SET @ErrorMessage = 'The value for the parameter @TransactionLogWaitTime is not supported.' + CHAR(13) + CHAR(10) + ' '
+    RAISERROR( @ErrorMessage, 16, 1 ) WITH NOWAIT
+	SET @Error = @@ERROR
+  END
+
+  IF @TransactionLogLowPercent < 0 OR @TransactionLogLowPercent > 100 OR @TransactionLogLowPercent > @TransactionLogHighPercent OR @TransactionLogLowPercent IS NULL
+  BEGIN
+    SET @ErrorMessage = 'The value for the parameter @TransactionLogLowPercent is not supported.' + CHAR(13) + CHAR(10) + ' '
+    RAISERROR( @ErrorMessage, 16, 1 ) WITH NOWAIT
+	SET @Error = @@ERROR
+  END
+
+  IF @TransactionLogHighPercent < 0 OR @TransactionLogHighPercent > 100 OR @TransactionLogHighPercent IS NULL
+  BEGIN
+    SET @ErrorMessage = 'The value for the parameter @TransactionLogHighPercent is not supported.' + CHAR(13) + CHAR(10) + ' '
+    RAISERROR( @ErrorMessage, 16, 1 ) WITH NOWAIT
+	SET @Error = @@ERROR
+  END
+
+  -- end add transaction log wait
+
   IF @Error <> 0
   BEGIN
     SET @ErrorMessage = 'The documentation is available at https://ola.hallengren.com/sql-server-index-and-statistics-maintenance.html.'
@@ -1645,8 +1689,73 @@ BEGIN
         RAISERROR(@EmptyLine,10,1) WITH NOWAIT
       END
 
+
+      -- 239_indexoptimize_tlog: add transaction log wait
+
+      SET @CurrentTransactionLogWaitTry = 0;
+      SET @CurrentTransactionLogWaitTime = DATEADD(ss, @TransactionLogWaitTime, '1900-01-01' );
+
+      -- end add transaction log wait
+
       WHILE (GETDATE() < DATEADD(ss,@TimeLimit,@StartTime) OR @TimeLimit IS NULL)
       BEGIN
+
+          -- 239_indexoptimize_tlog: add transaction log wait
+
+        IF ( @TransactionLogWaitTries is not null )
+        BEGIN
+
+          SELECT	@CurrentTransactionLogPercent = CONVERT(TINYINT, pc.cntr_value)
+          FROM	sys.dm_os_performance_counters pc
+          WHERE	pc.[object_name] = COALESCE( ( 'MSSQL$' + CONVERT(VARCHAR(128), SERVERPROPERTY('InstanceName') ) ), 'SQLServer' ) + ':Databases'
+              AND pc.[counter_name] = 'Percent Log Used'
+              AND pc.[instance_name] = @CurrentDatabaseName;
+
+          IF ( 
+            @CurrentTransactionLogPercent >= @TransactionLogHighPercent
+            AND @CurrentTransactionLogWaitTry = 0 
+          )
+          BEGIN
+            SET @ErrorMessage = 'Transaction log usage (%d%%) for database [%s] exceeded high threshold (%d%%). Waiting.';
+            RAISERROR ( @ErrorMessage, 10, 1, @CurrentTransactionLogPercent, @CurrentDatabaseName, @TransactionLogHighPercent) WITH NOWAIT;
+            SET @CurrentTransactionLogWaitTry = @CurrentTransactionLogWaitTry + 1;
+          END
+
+          IF ( 
+            @CurrentTransactionLogPercent >= @TransactionLogLowPercent
+            AND @CurrentTransactionLogWaitTry >= @TransactionLogWaitTries
+          )
+          BEGIN
+            SET @ErrorMessage = 'Number of transaction log wait tries (%d) exceeded threshold (%d). Exiting.';
+            RAISERROR ( @ErrorMessage, 10, 1, @CurrentTransactionLogWaitTry, @TransactionLogWaitTries ) WITH NOWAIT;
+            BREAK;
+          END
+
+          IF ( 
+            @CurrentTransactionLogPercent >= @TransactionLogLowPercent
+            AND @CurrentTransactionLogWaitTry > 0
+          )
+          BEGIN
+            SET @ErrorMessage = 'Wait try %d, waiting for %d seconds...';
+            RAISERROR( @ErrorMessage, 10, 1, @CurrentTransactionLogWaitTry, @TransactionLogWaitTime ) WITH NOWAIT;
+
+            WAITFOR DELAY @CurrentTransactionLogWaitTime;
+            SET @CurrentTransactionLogWaitTry = @CurrentTransactionLogWaitTry + 1;
+            CONTINUE;
+          END
+
+          IF ( @CurrentTransactionLogPercent < @TransactionLogLowPercent
+          AND @CurrentTransactionLogWaitTry > 0 
+          )
+          BEGIN
+            SET @ErrorMessage = 'Transaction log usage (%d%%) for database [%s] has reached low threshold (%d%%.) Resuming.';
+            RAISERROR( @ErrorMessage, 10, 1, @CurrentTransactionLogPercent, @CurrentDatabaseName, @TransactionLogLowPercent ) WITH NOWAIT;
+            SELECT @CurrentTransactionLogWaitTry = 0;
+          END
+        END
+
+        -- end transaction log wait
+
         SELECT TOP 1 @CurrentIxID = ID,
                      @CurrentIxOrder = [Order],
                      @CurrentSchemaID = SchemaID,
